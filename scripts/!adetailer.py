@@ -55,6 +55,7 @@ import cv2
 import numpy as np
 from skimage import exposure
 from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+from PIL import Image
 
 
 no_huggingface = getattr(cmd_opts, "ad_no_huggingface", False)
