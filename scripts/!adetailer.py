@@ -51,6 +51,12 @@ from modules.processing import (
 from modules.sd_samplers import all_samplers
 from modules.shared import cmd_opts, opts, state
 
+import cv2
+import numpy as np
+from skimage import exposure
+from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+
+
 no_huggingface = getattr(cmd_opts, "ad_no_huggingface", False)
 adetailer_dir = Path(models_path, "adetailer")
 extra_models_dir = shared.opts.data.get("ad_extra_models_dir", "")
@@ -123,6 +129,10 @@ class AfterDetailerScript(scripts.Script):
     def __init__(self):
         super().__init__()
         self.ultralytics_device = self.get_ultralytics_device()
+
+        self.face_parser__image_processor = SegformerImageProcessor.from_pretrained("jonathandinu/face-parsing")
+        self.face_parser = SegformerForSemanticSegmentation.from_pretrained("jonathandinu/face-parsing")
+        self.face_parser.to('cpu')
 
         self.controlnet_ext = None
 
@@ -567,7 +577,7 @@ class AfterDetailerScript(scripts.Script):
             x_offset=args.ad_x_offset,
             y_offset=args.ad_y_offset,
             merge_invert=args.ad_mask_merge_invert,
-        )
+        ), pred.bboxes
 
     @staticmethod
     def ensure_rgb_image(image: Any):
@@ -650,7 +660,7 @@ class AfterDetailerScript(scripts.Script):
             return False
 
         i = self.get_i(p)
-
+        print(args)
         pp.image = self.get_i2i_init_image(p, pp)
         i2i = self.get_i2i_p(p, args, pp.image)
         seed, subseed = self.get_seed(p)
@@ -670,7 +680,7 @@ class AfterDetailerScript(scripts.Script):
         with change_torch_load():
             pred = predictor(ad_model, pp.image, args.ad_confidence, **kwargs)
 
-        masks = self.pred_preprocessing(pred, args)
+        masks, bboxes = self.pred_preprocessing(pred, args)
         shared.state.assign_current_image(pred.preview)
 
         if not masks:
@@ -687,6 +697,7 @@ class AfterDetailerScript(scripts.Script):
         )
 
         steps = len(masks)
+        print("STEPS: ", steps)
         processed = None
         state.job_count += steps
 
@@ -715,8 +726,37 @@ class AfterDetailerScript(scripts.Script):
                 p2.close()
 
             self.compare_prompt(p2, processed, n=n)
-            p2 = copy(i2i)
+            # p2 = copy(i2i)
+
+            original_image = np.array(p2.init_images[0])
             p2.init_images = [processed.images[0]]
+            adetailer_image = np.array(processed.images[0])
+
+            if args.ad_use_custom_color_equalization:
+                h, w = original_image.shape[:2]
+                cur_padding = 20
+
+                x1, y1, x2, y2 = np.array(bboxes[j]).astype(np.int32)
+                x1, y1, x2, y2 = max(x1-cur_padding, 0), max(y1-cur_padding, 0), min(x2+cur_padding, w-1), min(y2+cur_padding, h-1)
+
+                face_original = original_image[y1:y2, x1:x2]
+                face_enhanced = adetailer_image[y1:y2, x1:x2]
+
+                face_original_mask = process_face_parser(self.face_parser__image_processor, self.face_parser, face_original)
+                face_enhanced_mask = process_face_parser(self.face_parser__image_processor, self.face_parser, face_enhanced)
+
+                face_original_mask, face_original_mask_blurred = get_blurred_mask_by_face_parser_mask(face_original_mask)
+                face_enhanced_mask, face_enhanced_mask_blurred = get_blurred_mask_by_face_parser_mask(face_enhanced_mask)
+
+                matched_img_full = exposure.match_histograms(face_enhanced, face_original)
+                matched_img = exposure.match_histograms(face_enhanced*face_original_mask[..., np.newaxis], face_original*face_original_mask[..., np.newaxis])
+                matched_img = matched_img_full*(1-face_original_mask[..., np.newaxis]) + matched_img*face_original_mask[..., np.newaxis]
+                matched_img = face_original*(1-face_original_mask_blurred[..., np.newaxis]) + matched_img*face_original_mask_blurred[..., np.newaxis]
+
+                original_image[y1:y2, x1:x2] = np.uint8(matched_img)
+
+                processed.images[0] = Image.fromarray(original_image)
+                p2.init_images = [Image.fromarray(original_image)]
 
         if processed is not None:
             pp.image = processed.images[0]
@@ -842,6 +882,32 @@ def on_ui_settings():
             False, "Use same seed for each tab in adetailer", section=section
         ),
     )
+
+
+def process_face_parser(image_processor, model_parser, face_crop):
+    face_crop = Image.fromarray(face_crop)
+
+    inputs = image_processor(images=face_crop, return_tensors="pt")
+    inputs = {k: v.to('cpu') for k, v in inputs.items()}
+    outputs = model_parser(**inputs)
+
+    logits = torch.nn.functional.interpolate(outputs.logits, size=face_crop.size[::-1], mode='bilinear', align_corners=False)
+
+    return logits.argmax(dim=1)[0].cpu().numpy()
+
+
+def get_blurred_mask_by_face_parser_mask(mask, sigma=51, kernel_erode=2, kernel_blur=20):
+    for ignore_val in [13, 14, 17, 18]:
+        mask[mask==ignore_val] = 0
+    mask[mask != 0] = 1
+
+    kernel = np.ones((kernel_erode, kernel_erode), np.uint8)
+    mask_blurred = cv2.erode((mask*255).astype(np.uint8), kernel, iterations=1)
+
+    blur_size = tuple(2*i+1 for i in (kernel_blur, kernel_blur))
+    mask_blurred = cv2.GaussianBlur(mask_blurred, blur_size, 0)
+
+    return mask, mask_blurred/255.
 
 
 # xyz_grid

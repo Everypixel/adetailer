@@ -180,6 +180,15 @@ def one_ui_group(n: int, is_img2img: bool, webui_info: WebuiInfo):
                 elem_id=eid("ad_negative_prompt"),
             )
 
+        with gr.Row():
+            with gr.Column(variant="compact"):
+                w.ad_use_custom_color_equalization = gr.Checkbox(
+                    label="Use custom color equalization" + suffix(n),
+                    value=False,
+                    visible=True,
+                    elem_id=eid("ad_use_custom_color_equalization"),
+                )
+
     with gr.Group():
         with gr.Accordion(
             "Detection", open=False, elem_id=eid("ad_detection_accordion")
